@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Service
+MimeType=all/allfiles;
+Actions=glovebox;
+X-KDE-Priority=TopLevel
+
+[Desktop Action glovebox]
+Name=Open in Glovebox
+Name[tr]=Glovebox'ta aç
+Icon=maze-glovebox
+Exec=/usr/bin/maze-glovebox --open %f

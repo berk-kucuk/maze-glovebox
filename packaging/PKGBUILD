@@ -1,0 +1,76 @@
+# Maintainer: berkkucukk <berkkucukk@proton.me>
+#
+# LOCAL-BUILD PKGBUILD — see ../build-pkg.sh, which writes `pkgver` and drops
+# `maze-glovebox-$pkgver.tar.gz` next to this file before invoking makepkg.
+
+pkgname=maze-glovebox
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Maze Glovebox — open a suspicious file in a sealed box: no network, none of your files"
+arch=('any')
+url="https://mazelinux.berkkucukk.com.tr"
+license=('GPL3')
+
+# No privileges, no service, no network. Every box is an unprivileged
+# bubblewrap sandbox started as the user.
+depends=(
+    'maze-python'      # shared Python runtime with PyQt6: /opt/maze/venv
+    'bubblewrap'       # the box
+    'xorg-xwayland'    # a separate X server for apps that only speak X11
+    'xdg-utils'        # the user's default app for a file type
+)
+makedepends=('imagemagick')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    cd "$srcdir/maze-glovebox-${pkgver}"
+
+    install -dm755 "$pkgdir/opt/maze-glovebox"
+    cp -r mazeglovebox main.py "$pkgdir/opt/maze-glovebox/"
+    chmod 755 "$pkgdir/opt/maze-glovebox/mazeglovebox/core/x11run.sh"
+    install -m644 MAZE-GLOVEBOX.png maze-glovebox-logo.svg "$pkgdir/opt/maze-glovebox/"
+
+    # -P and no cd: files given on the command line are relative to the caller.
+    install -dm755 "$pkgdir/usr/bin"
+    install -m755 /dev/stdin "$pkgdir/usr/bin/maze-glovebox" << 'LAUNCHER'
+#!/usr/bin/env bash
+exec /opt/maze/venv/bin/python3 -P /opt/maze-glovebox/main.py "$@"
+LAUNCHER
+
+    install -dm755 "$pkgdir/usr/share/applications"
+    install -m644 /dev/stdin "$pkgdir/usr/share/applications/maze-glovebox.desktop" << 'DESKTOP'
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Maze Glovebox
+GenericName=Open Suspicious Files Safely
+GenericName[tr]=Şüpheli Dosyaları Güvenle Aç
+Comment=Open a file in a sealed box with no network and none of your files
+Comment[tr]=Bir dosyayı ağı ve dosyalarınıza erişimi olmayan kapalı bir kutuda açın
+Exec=/usr/bin/maze-glovebox %f
+Icon=maze-glovebox
+Terminal=false
+Categories=Utility;Security;
+Keywords=sandbox;suspicious;attachment;malware;safe;open;kum havuzu;şüpheli;ek;güvenli;
+StartupNotify=true
+StartupWMClass=maze-glovebox
+DESKTOP
+
+    # Dolphin: right-click any file → Open in Glovebox (its default app, boxed).
+    install -Dm644 maze-glovebox-servicemenu.desktop \
+        "$pkgdir/usr/share/kio/servicemenus/maze-glovebox.desktop"
+
+    install -Dm644 maze-glovebox-logo.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/maze-glovebox.svg"
+    for size in 16 22 24 32 48 64 128 256 512; do
+        install -dm755 "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps"
+        magick MAZE-GLOVEBOX.png -resize "${size}x${size}" \
+            "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/maze-glovebox.png" \
+            2>/dev/null || install -m644 MAZE-GLOVEBOX.png \
+            "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/maze-glovebox.png"
+    done
+
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
