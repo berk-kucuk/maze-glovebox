@@ -22,6 +22,7 @@ import os
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -131,17 +132,56 @@ def stage_file(src: Path, box: Path) -> Path:
     """Copy the file into the box's home. Returns its path inside the box."""
     home = box / "home"
     home.mkdir(parents=True, mode=0o700)
-    size = src.stat().st_size
-    free = shutil.disk_usage(home).free
-    if size > free - 64 * 1024 * 1024:
-        raise SessionError("too_big", f"{size} bytes")
-    dest = home / src.name
+    # Opened once, without blocking, and every check made on what was opened
+    # (audit GB5): a path checked and then copied by name could be swapped for
+    # a FIFO in between, and copying a FIFO waits forever. Kernel files under
+    # /proc and /sys look like regular files but are not documents (and report
+    # size 0, which would defeat the size check).
+    real = os.path.realpath(src)
+    if real.startswith(("/proc/", "/sys/", "/dev/")):
+        raise SessionError("unreadable", f"{real} is not a file on disk")
     try:
-        shutil.copyfile(src, dest, follow_symlinks=True)
+        fd = os.open(real, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError as e:
         raise SessionError("unreadable", str(e)) from e
-    os.chmod(dest, 0o600)
+    with os.fdopen(fd, "rb") as fin:
+        st = os.fstat(fin.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise SessionError("unreadable", f"{real} is not a regular file")
+        os.set_blocking(fin.fileno(), True)
+        free = shutil.disk_usage(home).free
+        limit = free - 64 * 1024 * 1024
+        if st.st_size > limit:
+            raise SessionError("too_big", f"{st.st_size} bytes")
+        dest = home / src.name
+        try:
+            with open(dest, "xb") as fout:
+                os.chmod(dest, 0o600)
+                copied = 0
+                while chunk := fin.read(1024 * 1024):
+                    copied += len(chunk)
+                    if copied > limit:          # grew while being copied
+                        raise SessionError("too_big", f"more than {limit} bytes")
+                    fout.write(chunk)
+        except OSError as e:
+            raise SessionError("unreadable", str(e)) from e
     return Path(sandbox.HOME) / src.name
+
+
+def _sandboxed_wayland(box: Path, handler: Handler, sid: str):
+    """A Wayland socket the compositor knows is the box's (audit GB3), or
+    None to use the session's own — on a compositor without
+    security-context-v1, where the box then works as before."""
+    from mazeglovebox.core import wlcontext
+    real = sandbox.wayland_socket()
+    if not real:
+        return None
+    app_id = "org.mazelinux.glovebox." + "".join(
+        c if c.isalnum() else "_" for c in Path(handler.desktop_id).stem)[:60]
+    try:
+        return wlcontext.create(real, box / "wl.sock", app_id, sid)
+    except (wlcontext.Unsupported, OSError):
+        return None
 
 
 def _looks_like_x11_only(stderr: str) -> bool:
@@ -176,17 +216,25 @@ def run(file: str | Path, handler: Handler, force_x11: bool = False,
             proc.terminate()
     old = {s: signal.signal(s, on_term) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
 
+    wl = None
     try:
         inside = stage_file(src, box)
+        wl = _sandboxed_wayland(box, handler, sid)
         record.write()
         notify("opened", app=handler.name, file=src.name)
         x11 = force_x11
         while not stop["flag"]:
-            argv = sandbox.bwrap_argv(box / "home", handler.argv(str(inside)), x11=x11)
-            err = tempfile.TemporaryFile()
-            started = time.time()
-            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                    stderr=err)
+            filt = sandbox.seccomp_filter()
+            try:
+                argv = sandbox.limited(sandbox.bwrap_argv(
+                    box / "home", handler.argv(str(inside)), x11=x11, seccomp_fd=filt,
+                    wayland=str(wl.socket_path) if wl else None))
+                err = tempfile.TemporaryFile()
+                started = time.time()
+                proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                        stderr=err, pass_fds=(filt,))
+            finally:
+                os.close(filt)          # bwrap has read it, or has its own copy
             code = proc.wait()
             err.seek(0)
             stderr = err.read()[-8000:].decode(errors="replace")
@@ -208,4 +256,6 @@ def run(file: str | Path, handler: Handler, force_x11: bool = False,
         for s, h in old.items():
             signal.signal(s, h)
         record.remove()
+        if wl is not None:
+            wl.close()
         shutil.rmtree(box, ignore_errors=True)

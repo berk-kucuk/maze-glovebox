@@ -9,6 +9,7 @@ shell commands.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -102,9 +103,43 @@ class BoxTestCase(Base):
         stage = self.tmp / "stage"
         stage.mkdir(exist_ok=True)
         (stage / "suspicious.pdf").write_text("%PDF fake")
-        argv = sandbox.bwrap_argv(stage, ["bash", "-c", script])
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        filt = sandbox.seccomp_filter()
+        try:
+            argv = sandbox.bwrap_argv(stage, ["bash", "-c", script], seccomp_fd=filt)
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=30, pass_fds=(filt,))
+        finally:
+            os.close(filt)
         return r.stdout + r.stderr
+
+    def test_kernel_attack_surface_is_closed(self):
+        """A taken-over viewer cannot reach the kernel interfaces most exploits use."""
+        probe = (
+            "import ctypes, errno\n"
+            "libc = ctypes.CDLL(None, use_errno=True)\n"
+            # x86_64 numbers: bpf, keyctl, perf_event_open, userfaultfd, io_uring_setup, ptrace
+            "for name, nr in [('bpf', 321), ('keyctl', 250), ('perf_event_open', 298),\n"
+            "                 ('userfaultfd', 323), ('io_uring_setup', 425), ('ptrace', 101)]:\n"
+            "    ctypes.set_errno(0)\n"
+            "    r = libc.syscall(nr, 0, 0, 0, 0, 0)\n"
+            "    print(name, r, errno.errorcode.get(ctypes.get_errno(), ctypes.get_errno()))\n"
+        )
+        out = self.inside(f"python3 -c {shlex.quote(probe)}; "
+                          "unshare -U true 2>/dev/null && echo USERNS-OPEN || echo userns-closed")
+        for name in ("bpf", "keyctl", "perf_event_open", "userfaultfd", "ptrace"):
+            self.assertIn(f"{name} -1 EPERM", out)
+        self.assertIn("io_uring_setup -1 ENOSYS", out)
+        self.assertIn("userns-closed", out)
+
+    def test_the_box_never_opens_without_the_filter(self):
+        with self.assertRaises(ValueError):
+            sandbox.bwrap_argv(self.tmp, ["true"])
+
+    def test_ordinary_work_still_runs(self):
+        out = self.inside("python3 -c 'import os, threading, tempfile; "
+                          "t = threading.Thread(target=print, args=(\"thread-ok\",)); t.start(); t.join(); "
+                          "print(open(tempfile.mkstemp()[1], \"w\").write(\"x\"))'; cat ~/suspicious.pdf")
+        self.assertIn("thread-ok", out)
+        self.assertIn("%PDF fake", out)
 
     def test_no_network_at_all(self):
         out = self.inside("ls /sys/class/net; (exec 3<>/dev/tcp/1.1.1.1/53) 2>/dev/null "
@@ -132,6 +167,89 @@ class BoxTestCase(Base):
         nprocs = int([l for l in out.splitlines() if l.strip().isdigit()][-1])
         self.assertLess(nprocs, 10, "the host's processes are not visible")
         self.assertIn("host=glovebox", out)
+
+    def test_etc_names_neither_the_user_nor_the_machine(self):
+        """GB2: the box used to see all of /etc — user names, machine-id,
+        and which VPN, Tor, wallet and Maze tools the machine runs."""
+        import getpass
+        real_mid = Path("/etc/machine-id").read_text().strip()
+        out = self.inside("cat /etc/machine-id /etc/hostname; cut -d: -f1 /etc/passwd; "
+                          "whoami; ls /etc")
+        self.assertNotIn(real_mid, out)
+        self.assertNotIn(getpass.getuser(), out.replace("glovebox", ""))
+        self.assertIn("glovebox", out)
+        listing = set(out.split())
+        for secret in ("shadow", "sudoers", "maze-cloak", "maze-ghost", "NetworkManager",
+                       "wireguard", "ssh", "tor", "mullvad-vpn", "openvpn", "crypttab",
+                       "fstab", "subuid"):
+            self.assertNotIn(secret, listing, secret)
+        self.assertIn("ld.so.cache", listing)
+
+    def test_every_box_has_its_own_machine_id(self):
+        a = self.inside("cat /etc/machine-id")
+        b = self.inside("cat /etc/machine-id")
+        self.assertRegex(a.strip(), r"^[0-9a-f]{32}$")
+        self.assertNotEqual(a, b)
+
+    def test_desktop_apps_still_start(self):
+        checks = [(app, cmd) for app, cmd in (
+            ("okular", "okular --version"), ("mpv", "mpv --version"),
+            ("gwenview", "gwenview --version"), ("kate", "kate --version"))
+            if shutil.which(app)]
+        if not checks:
+            self.skipTest("no desktop viewer installed")
+        for app, cmd in checks:
+            out = self.inside(f"QT_QPA_PLATFORM=offscreen {cmd} >/dev/null 2>/tmp/e; echo rc=$?; head -3 /tmp/e")
+            self.assertIn("rc=0", out, f"{app}: {out}")
+
+    def test_box_runs_with_a_memory_and_task_ceiling(self):
+        """GB4: a crafted file must not be able to take the desktop's RAM.
+        Read from outside: inside, the box has a cgroup namespace of its own."""
+        from unittest import mock
+        stage = self.tmp / "stage"
+        stage.mkdir(exist_ok=True)
+        filt = sandbox.seccomp_filter()
+        try:
+            box_argv = sandbox.bwrap_argv(stage, ["sleep", "5"], seccomp_fd=filt)
+            with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}):
+                argv = sandbox.limited(box_argv)
+                if argv[0] != "systemd-run":
+                    self.skipTest("no user systemd here")
+                proc = subprocess.Popen(argv, pass_fds=(filt,), stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE)
+        finally:
+            os.close(filt)
+        try:
+            mine = Path("/proc/self/cgroup").read_text().strip().split("::", 1)[-1]
+            cg = mine
+            for _ in range(100):        # until systemd-run has moved into its scope
+                cg = Path(f"/proc/{proc.pid}/cgroup").read_text().strip().split("::", 1)[-1]
+                if cg != mine and cg.endswith(".scope"):
+                    break
+                time.sleep(0.05)
+            self.assertNotEqual(cg, mine, "the box stayed in our own cgroup")
+            base = Path("/sys/fs/cgroup") / cg.lstrip("/")
+            self.assertNotEqual((base / "memory.max").read_text().strip(), "max")
+            self.assertEqual((base / "pids.max").read_text().strip(), "1024")
+        finally:
+            proc.kill()
+            proc.wait(10)
+
+    def test_staging_refuses_what_is_not_a_document(self):
+        """GB5: a FIFO would hang the copy; /proc files are not documents."""
+        box = self.tmp / "box"
+        fifo = self.tmp / "pipe.pdf"
+        os.mkfifo(fifo)
+        for bad in (fifo, Path("/proc/self/environ")):
+            with self.assertRaises(session.SessionError):
+                session.stage_file(bad, box / bad.name.replace("/", "_"))
+        link = self.tmp / "link.pdf"
+        real = self.tmp / "real.pdf"
+        real.write_bytes(b"%PDF real")
+        link.symlink_to(real)
+        inside = session.stage_file(link, self.tmp / "box2")
+        self.assertEqual((self.tmp / "box2" / "home" / "link.pdf").read_bytes(), b"%PDF real")
+        self.assertEqual(inside.name, "link.pdf")
 
     def test_system_is_read_only(self):
         out = self.inside("touch /etc/x 2>/dev/null && echo WROTE-ETC; "
@@ -175,11 +293,11 @@ class SessionTestCase(Base):
         modes = []
         real = sandbox.bwrap_argv
 
-        def spy(stage, argv, x11=False, wayland=None):
+        def spy(stage, argv, x11=False, wayland=None, seccomp_fd=None):
             modes.append(x11)
             if x11:          # do not start a real Xwayland in a test
-                return real(stage, ["true"], x11=False, wayland=wayland)
-            return real(stage, argv, x11=x11, wayland=wayland)
+                return real(stage, ["true"], x11=False, wayland=wayland, seccomp_fd=seccomp_fd)
+            return real(stage, argv, x11=x11, wayland=wayland, seccomp_fd=seccomp_fd)
         with mock.patch.object(sandbox, "bwrap_argv", side_effect=spy):
             session.run(f, h)
         self.assertEqual(modes, [False, True])
@@ -234,3 +352,42 @@ class I18nTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class WaylandContextTestCase(unittest.TestCase):
+    """GB3: the box's Wayland socket is marked as sandboxed, so the compositor
+    hides its privileged protocols (clipboard snooping, fake input, screen
+    capture) from whatever runs inside. Needs a live compositor that offers
+    security-context-v1 (KWin 6 does)."""
+
+    def test_privileged_globals_are_hidden(self):
+        import tempfile as _t
+        from mazeglovebox.core import wlcontext
+        rt = f"/run/user/{os.getuid()}"
+        display = os.environ.get("WAYLAND_DISPLAY", "")
+        real = os.path.join(rt, display) if display and not os.path.isabs(display) else display
+        if not real or not os.path.exists(real) or not shutil.which("wayland-info"):
+            self.skipTest("no Wayland session")
+        d = Path(_t.mkdtemp(dir=rt))
+        try:
+            try:
+                ctx = wlcontext.create(real, d / "wl.sock", "org.mazelinux.glovebox.test", "t")
+            except wlcontext.Unsupported as e:
+                self.skipTest(f"compositor without security-context-v1: {e}")
+
+            def names(path):
+                out = subprocess.run(["wayland-info"], env=dict(os.environ, WAYLAND_DISPLAY=str(path)),
+                                     capture_output=True, text=True, timeout=10).stdout
+                return {l.split("'")[1] for l in out.splitlines() if "interface: '" in l}
+            normal, boxed = names(real), names(ctx.socket_path)
+            self.assertIn("wl_compositor", boxed)
+            self.assertNotIn("wp_security_context_manager_v1", boxed)
+            self.assertLess(len(boxed), len(normal))
+            for priv in ("org_kde_kwin_fake_input", "ext_data_control_manager_v1",
+                         "zkde_screencast_unstable_v1"):
+                if priv in normal:
+                    self.assertNotIn(priv, boxed, priv)
+            ctx.close()
+            self.assertFalse(ctx.socket_path.exists())
+        finally:
+            shutil.rmtree(d, ignore_errors=True)

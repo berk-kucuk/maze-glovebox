@@ -5,7 +5,7 @@
 
 pkgname=maze-glovebox
 pkgver=1.0.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Maze Glovebox — open a suspicious file in a sealed box: no network, none of your files"
 arch=('any')
 url="https://mazelinux.berkkucukk.com.tr"

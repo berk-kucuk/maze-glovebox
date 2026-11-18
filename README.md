@@ -21,7 +21,7 @@ An attachment you did not expect, a PDF from a site you do not trust, a document
 | | |
 |---|---|
 | **No network** | A network namespace of its own with no interface: not the internet, not your LAN, not even this computer's loopback. A document that tries to "phone home" — tracking pixels, exploit second stages — has nowhere to go. |
-| **None of your files** | Its home folder holds only the copy of this one file, on tmpfs. Your documents, SSH keys, browser profiles and other files do not exist inside. The system (`/usr`, `/etc`, `/opt`) is there read-only, so the app runs and can change nothing. |
+| **None of your files** | Its home folder holds only the copy of this one file, on tmpfs. Your documents, SSH keys, browser profiles and other files do not exist inside. The system (`/usr`, `/opt`) is there read-only, so the app runs and can change nothing. Of `/etc` it sees only what programs need to start and look right; it never sees your user name, the machine ID or which VPN, Tor, wallet and Maze tools you run. It gets a made-up user, hostname and a fresh machine ID for every box. |
 | **No way to your other apps** | No session or system D-Bus, no sound, no GPU, no real X server, no capabilities, its own process list. It also cannot hand the file to a copy of the app already open outside the box. |
 | **Nothing left behind** | The copy and anything the app writes live in memory and are deleted when the app closes. The original is read once and never changed. |
 
